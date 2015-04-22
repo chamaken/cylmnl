@@ -1,0 +1,417 @@
+from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
+from libc.stdlib cimport exit, atoi, EXIT_SUCCESS, EXIT_FAILURE
+from libc.stdio cimport perror, printf, fprintf, stderr
+from libc.errno cimport errno, ENOBUFS, EINTR
+from libcpp.list cimport list
+from cython.operator cimport dereference as deref, preincrement as inc
+
+cimport cylmnl as mnl
+cimport cylmnl.linux.netlinkh as netlink
+cimport cylmnl.linux.netfilter.nfnetlinkh as nfnl
+cimport cylmnl.linux.netfilter.nfnetlink_conntrackh as nfct
+cimport cylmnl.linux.netfilter.nfnetlink_compath as nfnlcm
+
+
+cdef extern from "netinet/in.h" nogil:
+    struct InAddr "in_addr":
+        pass
+    struct In6Addr "in6_addr":
+        pass
+    enum: INET6_ADDRSTRLEN
+
+
+cdef extern from "endian.h" nogil:
+    enum: __BYTE_ORDER
+    enum: __LITTLE_ENDIAN
+    enum: __BIG_ENDIAN
+
+
+cdef extern from "arpa/inet.h" nogil:
+    uint32_t htonl(uint32_t hostlong)
+    uint16_t htons(uint16_t hostshort)
+    uint32_t ntohl(uint32_t netlong)
+    uint16_t ntohs(uint16_t netshort)	   
+
+    ctypedef unsigned int socklen_t # XXX
+    const char *inet_ntop(int af, const void *src,
+                	  char *dst, socklen_t size)
+
+
+cdef extern from "sys/socket.h" nogil:
+    enum: AF_INET
+    enum: AF_INET6
+    int setsockopt(int sockfd, int level, int optname,
+                   const void *optval, socklen_t optlen)
+    enum: SOL_SOCKET
+    enum: SO_RCVBUFFORCE
+
+
+cdef extern from "string.h" nogil:
+    int memcmp(const void *s1, const void *s2, size_t n)
+
+
+cdef extern from "stdlib.h" nogil:
+    void free(void *ptr)
+    void *calloc(size_t nmemb, size_t size)
+
+
+cdef extern from "unistd.h" nogil:
+    int nice(int inc)
+
+
+cdef extern from "sys/select.h" nogil:
+    struct Timeval "timeval":
+        long tv_sec
+        long tv_usec
+    ctypedef struct FdSet "fd_set":
+        pass
+
+    int select(int nfds, FdSet *readfds, FdSet *writefds,
+               FdSet *exceptfds, Timeval *timeout)
+
+    void FD_CLR(int fd, FdSet *set)
+    int	 FD_ISSET(int fd, FdSet *set)
+    void FD_SET(int fd, FdSet *set)
+    void FD_ZERO(FdSet *set)
+
+
+cdef extern from "inttypes.h" nogil:
+    enum: PRIu64
+
+
+
+cdef inline uint64_t be64toh(uint64_t y) nogil:
+    if __BYTE_ORDER == __LITTLE_ENDIAN:
+        return <uint64_t>ntohl(y) << 32 | ntohl(y >> 32)
+    return y
+
+
+cdef union _Ipaddr:
+    InAddr ip
+    In6Addr ip6
+
+
+cdef struct Nstats:
+    uint8_t family
+    _Ipaddr _addr
+    uint64_t pkts, bytes
+
+
+cdef list[Nstats *] nstats_head
+
+
+cdef int parse_counters_cb(const netlink.Nlattr *attr, void *data) nogil:
+    cdef const netlink.Nlattr **tb = <const netlink.Nlattr **>data
+    cdef int attr_type = mnl.attr_get_type(attr)
+
+    if mnl.attr_type_valid(attr, nfct.CTA_COUNTERS_MAX) < 0:
+        return mnl.MNL_CB_OK
+
+    if attr_type == nfct.CTA_COUNTERS_PACKETS \
+            or attr_type == nfct.CTA_COUNTERS_BYTES:
+        if mnl.attr_validate(attr, mnl.MNL_TYPE_U64) < 0:
+            perror("mnl_attr_validate")
+            return mnl.MNL_CB_ERROR
+
+    tb[attr_type] = attr
+    return mnl.MNL_CB_OK
+
+
+cdef void parse_counters(const netlink.Nlattr *nest, Nstats *ns) nogil:
+    cdef netlink.Nlattr *tb[nfct.CTA_COUNTERS_MAX + 1] # = {}
+
+    # XXX: need all zeroing by loop?
+    for i in range(nfct.CTA_COUNTERS_MAX): tb[i] = NULL
+
+    mnl.attr_parse_nested(nest, <mnl.attr_cb_t>parse_counters_cb, tb)
+    if tb[nfct.CTA_COUNTERS_PACKETS] != NULL:
+        ns.pkts += be64toh(mnl.attr_get_u64(tb[nfct.CTA_COUNTERS_PACKETS]))
+
+    if tb[nfct.CTA_COUNTERS_BYTES] != NULL:
+        ns.bytes += be64toh(mnl.attr_get_u64(tb[nfct.CTA_COUNTERS_BYTES]))
+
+
+cdef int parse_ip_cb(const netlink.Nlattr *attr, void *data) nogil:
+    cdef const netlink.Nlattr **tb = <const netlink.Nlattr **>data
+    cdef int attr_type = mnl.attr_get_type(attr)
+
+    if mnl.attr_type_valid(attr, nfct.CTA_IP_MAX) < 0:
+        return mnl.MNL_CB_OK
+
+    if attr_type == nfct.CTA_IP_V4_SRC \
+            or attr_type == nfct.CTA_IP_V4_DST:
+        if mnl.attr_validate(attr, mnl.MNL_TYPE_U32) < 0:
+            perror("mnl_attr_validate")
+            return mnl.MNL_CB_ERROR
+    elif attr_type == nfct.CTA_IP_V6_SRC \
+            or attr_type == nfct.CTA_IP_V6_DST:
+        if mnl.attr_validate2(attr, mnl.MNL_TYPE_BINARY, sizeof(In6Addr)) < 0:
+            perror("mnl_attr_validate2")
+            return mnl.MNL_CB_ERROR
+
+    tb[attr_type] = attr
+    return mnl.MNL_CB_OK
+
+
+cdef void parse_ip(const netlink.Nlattr *nest, Nstats *ns) nogil:
+    cdef netlink.Nlattr *tb[nfct.CTA_IP_MAX + 1] # = {}
+    cdef InAddr *inaddr
+    cdef In6Addr *in6addr
+
+    # XXX:
+    for i in range(nfct.CTA_IP_MAX): tb[i] = NULL
+
+    mnl.attr_parse_nested(nest, <mnl.attr_cb_t>parse_ip_cb, tb)
+    if tb[nfct.CTA_IP_V4_SRC] != NULL:
+        inaddr = <InAddr *>mnl.attr_get_payload(tb[nfct.CTA_IP_V4_SRC])
+        ns._addr.ip = inaddr[0]
+        ns.family = AF_INET
+    if tb[nfct.CTA_IP_V6_SRC] != NULL:
+        in6addr = <In6Addr *>mnl.attr_get_payload(tb[nfct.CTA_IP_V6_SRC])
+        ns._addr.ip6 = in6addr[0]
+        ns.family = AF_INET6
+
+
+cdef int parse_tuple_cb(const netlink.Nlattr *attr, void *data) nogil:
+    cdef const netlink.Nlattr **tb = <const netlink.Nlattr **>data
+    cdef int attr_type = mnl.attr_get_type(attr)
+
+    if mnl.attr_type_valid(attr, nfct.CTA_TUPLE_MAX) < 0:
+        return mnl.MNL_CB_OK
+
+    if attr_type == nfct.CTA_TUPLE_IP:
+        if mnl.attr_validate(attr, mnl.MNL_TYPE_NESTED) < 0:
+            perror("mnl_attr_validate")
+            return mnl.MNL_CB_ERROR
+
+    tb[attr_type] = attr
+    return mnl.MNL_CB_OK
+
+
+cdef void parse_tuple(const netlink.Nlattr *nest, Nstats *ns) nogil:
+    cdef netlink.Nlattr *tb[nfct.CTA_TUPLE_MAX + 1] # = {}
+
+    # XXX:
+    for i in range(nfct.CTA_TUPLE_MAX): tb[i] = NULL
+
+    mnl.attr_parse_nested(nest, <mnl.attr_cb_t>parse_tuple_cb, tb)
+    if tb[nfct.CTA_TUPLE_IP] != NULL:
+        parse_ip(tb[nfct.CTA_TUPLE_IP], ns)
+
+
+cdef int data_attr_cb(const netlink.Nlattr *attr, void *data) nogil:
+    cdef const netlink.Nlattr **tb = <const netlink.Nlattr **>data
+    cdef int attr_type = mnl.attr_get_type(attr)
+
+    if mnl.attr_type_valid(attr, nfct.CTA_MAX) < 0:
+        return mnl.MNL_CB_OK
+
+    if attr_type == nfct.CTA_TUPLE_ORIG \
+            or attr_type == nfct.CTA_COUNTERS_ORIG \
+            or attr_type == nfct.CTA_COUNTERS_REPLY:
+        if mnl.attr_validate(attr, mnl.MNL_TYPE_NESTED) < 0:
+            perror("mnl_attr_validate")
+            return mnl.MNL_CB_ERROR
+
+    tb[attr_type] = attr
+    return mnl.MNL_CB_OK
+
+
+cdef int data_cb(const netlink.Nlmsghdr *nlh, void *data) nogil:
+    cdef netlink.Nlattr *tb[nfct.CTA_MAX + 1] # = {}
+    cdef nfnl.Nfgenmsg *nfg = <nfnl.Nfgenmsg *>mnl.nlmsg_get_payload(nlh)
+    cdef list[Nstats *].iterator it
+    cdef Nstats ns = {}, *cur, *newns
+    cdef char out[INET6_ADDRSTRLEN]
+
+    # XXX:
+    for i in range(nfct.CTA_MAX): tb[i] = NULL
+
+    mnl.attr_parse(nlh, sizeof(nfnl.Nfgenmsg), <mnl.attr_cb_t>data_attr_cb, tb)
+    if tb[nfct.CTA_TUPLE_ORIG] != NULL:
+        parse_tuple(tb[nfct.CTA_TUPLE_ORIG], &ns)
+
+    if tb[nfct.CTA_COUNTERS_ORIG] != NULL:
+        parse_counters(tb[nfct.CTA_COUNTERS_ORIG], &ns)
+
+    if tb[nfct.CTA_COUNTERS_REPLY] != NULL:
+        parse_counters(tb[nfct.CTA_COUNTERS_REPLY], &ns)
+
+    # Look up for existing statistics object
+    it = nstats_head.begin()
+    while it != nstats_head.end():
+        cur = deref(it)
+        if memcmp(&ns._addr.ip6, &cur._addr.ip6, sizeof(In6Addr)) == 0:
+            # ... and sum counters 
+            cur.pkts += ns.pkts
+            cur.bytes += ns.bytes
+            return mnl.MNL_CB_OK
+        inc(it)
+
+    # ... if it does not exist, add new stats object
+    newns = <Nstats *>calloc(1, sizeof(Nstats))
+    if newns == NULL:
+        return mnl.MNL_CB_OK
+
+    newns.family = ns.family
+    newns._addr.ip6 = ns._addr.ip6
+    newns.pkts = ns.pkts
+    newns.bytes = ns.bytes
+
+    nstats_head.push_front(newns)
+
+    return mnl.MNL_CB_OK
+
+
+cdef int handle(mnl.Socket *nl) nogil:
+    cdef char buf[mnl.MNL_SOCKET_BUFFER_SIZE]
+    cdef int ret
+
+    ret = mnl.socket_recvfrom(nl, buf, sizeof(buf))
+    if ret == -1:
+        # It only happens if NETLINK_NO_ENOBUFS is not set, it means
+        # we are leaking statistics.
+        if errno == ENOBUFS:
+            fprintf(stderr, "The daemon has hit ENOBUFS, you can "
+                    "increase the size of your receiver "
+                    "buffer to mitigate this or enable "
+                    "reliable delivery.\n")
+        else:
+            perror("mnl_socket_recvfrom")
+        return -1
+
+    ret = mnl.cb_run(buf, ret, 0, 0, <mnl.cb_t>data_cb, NULL)
+    if ret == mnl.MNL_CB_ERROR:
+        perror("mnl_cb_run")
+        return -1
+    elif ret <= mnl.MNL_CB_STOP:
+        return 0
+
+    return 0
+
+
+cdef int main(int argc, char *argv[]) nogil:
+    cdef mnl.Socket *nl
+    cdef char buf[mnl.MNL_SOCKET_BUFFER_SIZE], out[INET6_ADDRSTRLEN]
+    cdef netlink.Nlmsghdr *nlh
+    cdef nfnl.Nfgenmsg *nfh
+    cdef Nstats *cur
+    cdef Timeval tv = {}
+    cdef int ret, secs, on = 1, buffersize = (1 << 22), fd_max
+    cdef FdSet readfds
+    cdef list[Nstats *].iterator it
+
+    if argc != 2:
+        printf("Usage: %s <poll-secs>\n", argv[0])
+        exit(EXIT_FAILURE)
+
+    secs = atoi(argv[1])
+    printf("Polling every %d seconds from kernel...\n", secs)
+
+    # Set high priority for this process, less chances to overrun
+    # the netlink receiver buffer since the scheduler gives this process
+    # more chances to run.
+    nice(-20)
+
+    # Open netlink socket to operate with netfilter
+    nl = mnl.socket_open(netlink.NETLINK_NETFILTER)
+    if nl == NULL:
+        perror("mnl_socket_open")
+        exit(EXIT_FAILURE)
+
+    # Subscribe to destroy events to avoid leaking counters. The same
+    # socket is used to periodically atomically dump and reset counters.
+    if mnl.socket_bind(nl, nfnlcm.NF_NETLINK_CONNTRACK_DESTROY,
+                       mnl.MNL_SOCKET_AUTOPID) < 0:
+        perror("mnl_socket_bind")
+        exit(EXIT_FAILURE)
+
+    # Set netlink receiver buffer to 16 MBytes, to avoid packet drops
+    setsockopt(mnl.socket_get_fd(nl), SOL_SOCKET, SO_RCVBUFFORCE,
+               &buffersize, <socklen_t>sizeof(socklen_t))
+
+    # The two tweaks below enable reliable event delivery, packets may
+    # be dropped if the netlink receiver buffer overruns. This happens ...
+    #
+    # a) if the kernel spams this user-space process until the receiver
+    #	 is filled.
+    #
+    # or:
+    #
+    # b) if the user-space process does not pull messages from the
+    #	 receiver buffer so often.
+    mnl.socket_setsockopt(nl, netlink.NETLINK_BROADCAST_ERROR, &on, sizeof(int))
+    mnl.socket_setsockopt(nl, netlink.NETLINK_NO_ENOBUFS, &on, sizeof(int))
+
+    nlh = mnl.nlmsg_put_header(buf)
+    # Counters are atomically zeroed in each dump
+    nlh.nlmsg_type = (nfnl.NFNL_SUBSYS_CTNETLINK << 8) | \
+        nfct.IPCTNL_MSG_CT_GET_CTRZERO
+    nlh.nlmsg_flags = netlink.NLM_F_REQUEST | netlink.NLM_F_DUMP
+
+    nfh = <nfnl.Nfgenmsg *>mnl.nlmsg_put_extra_header(nlh, sizeof(nfnl.Nfgenmsg))
+    nfh.nfgen_family = AF_INET
+    nfh.version = nfnl.NFNETLINK_V0
+    nfh.res_id = 0
+
+    # Filter by mark: We only want to dump entries whose mark is zero
+    mnl.attr_put_u32(nlh, nfct.CTA_MARK, htonl(0))
+    mnl.attr_put_u32(nlh, nfct.CTA_MARK_MASK, htonl(0xffffffff))
+
+    while True:
+        fd_max = mnl.socket_get_fd(nl)
+        # Every N seconds ...
+        if tv.tv_sec == 0 and tv.tv_usec == 0:
+            # ... request a fresh dump of the table from kernel
+            ret = mnl.socket_sendto(nl, nlh, nlh.nlmsg_len)
+            if ret == -1:
+                perror("mnl_socket_sendto")
+                return -1
+
+            tv.tv_sec = secs
+            tv.tv_usec = 0
+
+            # print the content of the list
+            it = nstats_head.begin()
+            while it != nstats_head.end():
+                cur = deref(it)
+                if inet_ntop(cur.family, &cur._addr.ip, out, <socklen_t>sizeof(out)):
+                    printf("src=%s ", out)
+                    # printf("counters %"PRIu64" %"PRIu64"\n",
+                    #	     cur.pkts, cur.bytes)
+                    printf("counters %u %u\n", cur.pkts, cur.bytes)
+                inc(it)
+
+        FD_ZERO(&readfds)
+        FD_SET(mnl.socket_get_fd(nl), &readfds)
+
+        ret = select(fd_max + 1, &readfds, NULL, NULL, &tv)
+        if ret < 0:
+            if errno == EINTR:
+                continue
+            perror("select")
+            exit(EXIT_FAILURE)
+
+        # Handled event and periodic atomic-dump-and-reset messages
+        if FD_ISSET(mnl.socket_get_fd(nl), &readfds):
+            if handle(nl) < 0:
+                return EXIT_FAILURE
+
+    mnl.socket_close(nl)
+
+    return 0
+
+
+# really? there must be more efficient way
+cdef extern from "alloca.h" nogil:
+    void *alloca(size_t size);
+
+import sys
+cdef int argc = len(sys.argv)
+cdef char **argv = <char **>alloca(sizeof(char *) * argc)
+for i, s in enumerate(sys.argv):
+    argv[i] = s
+
+if __name__ == "__main__":
+    with nogil:
+        main(argc, argv)
